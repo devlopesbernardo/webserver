@@ -300,6 +300,110 @@ EOF
   echo "DB PASS: ${DBPASS}"
 }
 
+
+
+function xshok_database_add_wp () { #domain
+  xshok_container_is_running "$CONTAINER_MYSQL"
+  xshok_validate_domain "${1}"
+
+  DBNAME="${FILTERED_DOMAIN}-$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 8 | head -n 1)"
+  DBUSER="$DBNAME"
+  DBPASS="$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1)"
+
+  if [ -f "${VHOST_DIR}/${DOMAIN}/dbinfo/${DBNAME}" ] ; then
+    echo "Database Info File Found"
+  fi
+
+  docker-compose exec -T ${CONTAINER_MYSQL} su -c "mysql -uroot -p${MYSQL_ROOT_PASSWORD} -e 'status'" >/dev/null 2>&1
+  if [ ${?} != 0 ]; then
+    echo 'ERROR: DB access failed, please check!'
+  fi
+
+  if docker-compose exec -T ${CONTAINER_MYSQL} su -c "mysql -uroot -p'${MYSQL_ROOT_PASSWORD}' -s -N -e \"SELECT IF(EXISTS (SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = '${DBNAME}'), 'yes','no')\"" | grep -q "yes" ; then
+    echo "ERROR: Database exists"
+    exit 1
+  else
+    echo "DATABASE: ${DBNAME}"
+  fi
+
+  echo "Start Transaction"
+  docker-compose exec -T ${CONTAINER_MYSQL} su -c "mysql -uroot -p'${MYSQL_ROOT_PASSWORD}' -qfNsBe 'START TRANSACTION'"
+  if [ ${?} != 0 ]; then
+    echo 'ERROR: failed starting transaction, please check!'
+    exit 1
+  fi
+  echo "- Create DB"
+  docker-compose exec -T ${CONTAINER_MYSQL} su -c "mysql -uroot -p'${MYSQL_ROOT_PASSWORD}' -qfNsBe 'CREATE DATABASE IF NOT EXISTS \`${DBNAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci'"
+  if [ ${?} != 0 ]; then
+    echo 'ERROR: create DB, please check!'
+    docker-compose exec -T ${CONTAINER_MYSQL} su -c "mysql -uroot -p'${MYSQL_ROOT_PASSWORD}' -qfNsBe 'ROLLBACK'"
+    exit 1
+  fi
+  echo "- Create user"
+  docker-compose exec -T ${CONTAINER_MYSQL} su -c "mysql -uroot -p'${MYSQL_ROOT_PASSWORD}' -qfNsBe 'CREATE USER IF NOT EXISTS \`${DBUSER}\`@\`%\`'"
+  if [ ${?} != 0 ]; then
+    echo 'ERROR:create user failed, please check!'
+    docker-compose exec -T ${CONTAINER_MYSQL} su -c "mysql -uroot -p'${MYSQL_ROOT_PASSWORD}' -qfNsBe 'ROLLBACK'"
+    exit 1
+  fi
+  echo "- Set user password"
+  docker-compose exec -T ${CONTAINER_MYSQL} su -c "mysql -uroot -p'${MYSQL_ROOT_PASSWORD}' -qfNsBe \"ALTER USER '${DBUSER}'@'%' IDENTIFIED BY '${DBPASS}'\""
+  if [ ${?} != 0 ]; then
+    echo 'ERROR: set user password failed, please check!'
+    docker-compose exec -T ${CONTAINER_MYSQL} su -c "mysql -uroot -p'${MYSQL_ROOT_PASSWORD}' -qfNsBe 'ROLLBACK'"
+    exit 1
+  fi
+  echo "- Assign permissions"
+  docker-compose exec -T ${CONTAINER_MYSQL} su -c "mysql -uroot -p'${MYSQL_ROOT_PASSWORD}' -qfNsBe 'GRANT ALL PRIVILEGES ON \`${DBNAME}\`.* TO \`${DBUSER}\`@\`%\`'"
+  if [ ${?} != 0 ]; then
+    echo 'ERROR: assign permissions failed, please check!'
+    docker-compose exec -T ${CONTAINER_MYSQL} su -c "mysql -uroot -p'${MYSQL_ROOT_PASSWORD}' -qfNsBe 'ROLLBACK'"
+    exit 1
+  fi
+  echo "Commit transaction"
+  docker-compose exec -T ${CONTAINER_MYSQL} su -c "mysql -uroot -p'${MYSQL_ROOT_PASSWORD}' -qfNsBe 'COMMIT'"
+  if [ ${?} != 0 ]; then
+    echo 'ERROR: failed starting transaction, please check!'
+    docker-compose exec -T ${CONTAINER_MYSQL} su -c "mysql -uroot -p'${MYSQL_ROOT_PASSWORD}' -qfNsBe 'ROLLBACK'"
+    exit 1
+  fi
+  echo "Flush (apply) privileges"
+  docker-compose exec -T ${CONTAINER_MYSQL} su -c "mysql -uroot -p'${MYSQL_ROOT_PASSWORD}' -qfNsBe 'FLUSH PRIVILEGES'"
+  if [ ${?} != 0 ]; then
+    echo 'ERROR: flush failed, please check!'
+    exit 1
+  fi
+  echo "Saving dbinfo to ${VHOST_DIR}/${DOMAIN}/dbinfo/${DBNAME}"
+  mkdir -p "${VHOST_DIR}/${DOMAIN}/dbinfo"
+  cat << EOF > "${VHOST_DIR}/${DOMAIN}/dbinfo/${DBNAME}"
+  DB NAME: ${DBNAME}
+  DB USER: ${DBUSER}
+  DB PASS: ${DBPASS}
+EOF
+  echo "DB NAME: ${DBNAME}"
+  echo "DB USER: ${DBUSER}"
+  echo "DB PASS: ${DBPASS}"
+  echo "Copying Wordpress + LSCache..."
+  cp -R custom_wp/WordPress-master/* volumes/www-vhosts/$1/html && 
+  echo "Configuring database..."
+  sed -i "s%database_name_here%${DBUSER}%g" volumes/www-vhosts/$1/html/wp-config.php && 
+  sed -i "s%username_here%${DBUSER}%g" volumes/www-vhosts/$1/html/wp-config.php && 
+  sed -i "s%password_here%${DBPASS}%g" volumes/www-vhosts/$1/html/wp-config.php &&
+  sed -i "s%localhost%mysql%g" volumes/www-vhosts/$1/html/wp-config.php
+  echo "Setting up permissions..."
+  find "${VHOST_DIR}/${DOMAIN}/html" -type f -exec chmod 0664 {} \;
+  find "${VHOST_DIR}/${DOMAIN}/html" -type d -exec chmod 0775 {} \;
+  echo "Setting Ownership"
+  chown -R nobody:nogroup "${VHOST_DIR}/${DOMAIN}/html"
+  echo "Finished"
+}
+
+function bernardo_create_bckp_bucket () {
+
+mkdir /mounted/users/${DOMAIN} && s3fs maq.01.devbernardo:/users/${DOMAIN} /mounted/users/${DOMAIN} -o passwd_file=/etc/passwd-s3fs -o use_path_request_style -o nonempty -o url=https://s3.us-west-1.wasabisys.com && echo "#seu backup foi criado com sucesso" > /mounted/users/${DOMAIN}/file.txt && ln -s /mounted/users/${DOMAIN} /datastore/volumes/www-vhosts/${DOMAIN}/backup
+    
+}
+
 ################## delete database and database user
 function xshok_database_delete () { #database
   DBNAME="${1}"
@@ -770,6 +874,8 @@ help_message () {
   echo -e "\033[1mQUICK OPTIONS\033[0m"
   echo "${EPACE}-qa | --quick-add [domain_name]"
   echo "${EPACE}${EPACE} add website, database, ssl, restart server"
+  echo "${EPACE}-qaw | --quick-addw [domain_name]"
+  echo "${EPACE}${EPACE} add website, database, ssl, installs wordpress, fix permissions and restart server"
   echo -e "\033[1mADVANCED OPTIONS\033[0m"
   echo "${EPACE}-wc | --warm-cache [domain_name]"
   echo "${EPACE}${EPACE} loads a website sitemap and visits each page, used to warm the cache"
@@ -884,6 +990,15 @@ while [ ! -z "${1}" ]; do
       xshok_website_add "$2"
       xshok_database_add "$2"
       xshok_ssl_add "$2"
+      xshok_restart
+      shift
+      ;;
+    -qaw | --quick-addw | --quickaddw )
+      xshok_check_s2 "$2";
+      xshok_website_add "$2"
+      xshok_database_add_wp "$2"
+      xshok_ssl_add "$2"
+      bernardo_create_bckp_bucket "$2"
       xshok_restart
       shift
       ;;
